@@ -845,4 +845,4 @@ func BenchmarkResolve(b *testing.B) {
 
 ---
 
-For more examples and updates, visit the [GitHub repository](https://github.com/dix).
+For more examples and updates, visit the [GitHub repository](https://github.com/kryovyx/dix).
