@@ -21,6 +21,10 @@ func (s *scopeTestService) Close() error {
 	return nil
 }
 
+// scopeOtherService is a second concrete type, so tests can register several
+// lifetimes at once — one type may carry only one registration.
+type scopeOtherService struct{}
+
 // errorCloser simulates a resource whose Close returns an error.
 type errorCloser struct {
 	closed bool
@@ -148,18 +152,39 @@ func TestDefaultScope_Resolve(t *testing.T) {
 
 func TestDefaultScope_ResolveAll(t *testing.T) {
 	t.Run("aggregates all dependencies", func(t *testing.T) {
-		// ResolveAll should collect singleton, transient, and scoped instances.
+		// ResolveAll on a scope collects all three lifetimes, scoped included:
+		// unlike the root container, a scope owns what it builds and closes it.
+		// Each lifetime needs its own type — one type may carry only one
+		// registration.
 		c := New()
-		c.Singleton(func() *scopeTestService { return &scopeTestService{} })
-		c.Transient(func() *scopeTestService { return &scopeTestService{} })
-		c.Scoped(func() *scopeTestService { return &scopeTestService{} })
+		if err := c.Singleton(func() *scopeTestService { return &scopeTestService{} }); err != nil {
+			t.Fatalf("singleton registration failed: %v", err)
+		}
+		if err := c.Transient(func() *scopeOtherService { return &scopeOtherService{} }); err != nil {
+			t.Fatalf("transient registration failed: %v", err)
+		}
+		if err := c.Scoped(func() *errorCloser { return &errorCloser{} }); err != nil {
+			t.Fatalf("scoped registration failed: %v", err)
+		}
 		s := c.NewScope().(*defaultScope)
 		var deps []interface{}
 		if err := s.ResolveAll(&deps); err != nil {
 			t.Fatalf("resolve all failed: %v", err)
 		}
-		if len(deps) < 3 {
-			t.Fatalf("expected at least 3 dependencies, got %d", len(deps))
+		if len(deps) != 3 {
+			t.Fatalf("expected 3 dependencies, got %d", len(deps))
+		}
+
+		// The scoped value ResolveAll built must be tracked, or Close would
+		// leave it open — it used to be constructed and dropped on the floor.
+		s.mu.Lock()
+		tracked := len(s.scopedInstances)
+		s.mu.Unlock()
+		if tracked != 1 {
+			t.Fatalf("expected ResolveAll to track its scoped instance, tracked %d", tracked)
+		}
+		if err := s.Close(); err == nil {
+			t.Fatal("expected the tracked errorCloser to be closed by Close")
 		}
 	})
 

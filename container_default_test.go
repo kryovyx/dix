@@ -18,6 +18,12 @@ func (s *containerTestService) Close() error {
 	return nil
 }
 
+// otherTestService is a second concrete type, so tests can register several
+// lifetimes at once — one type may carry only one registration.
+type otherTestService struct {
+	value int
+}
+
 // closerInterface models any type with a Close method for interface resolution tests.
 type closerInterface interface {
 	Close() error
@@ -414,24 +420,48 @@ func TestDefaultContainer_Resolve(t *testing.T) {
 }
 
 func TestDefaultContainer_ResolveAll(t *testing.T) {
-	t.Run("resolves all registered dependencies", func(t *testing.T) {
-		// ResolveAll should gather singleton, transient, and scoped instances.
+	t.Run("resolves singleton and transient registrations", func(t *testing.T) {
+		// ResolveAll gathers singletons and transients. Each lifetime needs a
+		// distinct type: one type may hold only one registration
+		// (ErrAlreadyRegistered), so the old shape — the same type registered
+		// three times over — is no longer expressible.
 		c := New()
 		if err := c.Singleton(func() *containerTestService { return &containerTestService{value: 6} }); err != nil {
 			t.Fatalf("singleton registration failed: %v", err)
 		}
-		if err := c.Transient(func() *containerTestService { return &containerTestService{value: 7} }); err != nil {
+		if err := c.Transient(func() *otherTestService { return &otherTestService{value: 7} }); err != nil {
 			t.Fatalf("transient registration failed: %v", err)
 		}
-		if err := c.Scoped(func() *containerTestService { return &containerTestService{value: 8} }); err != nil {
+		var deps []interface{}
+		if err := c.ResolveAll(&deps); err != nil {
+			t.Fatalf("resolve all failed: %v", err)
+		}
+		if len(deps) != 2 {
+			t.Fatalf("expected 2 dependencies, got %d", len(deps))
+		}
+	})
+
+	t.Run("skips scoped registrations", func(t *testing.T) {
+		// Building a scoped value from the root would leave it with no owning
+		// scope, so nothing would ever Close it — the leak ErrScopedFromRoot
+		// documents. ResolveAll therefore omits scoped types entirely.
+		c := New()
+		if err := c.Singleton(func() *containerTestService { return &containerTestService{value: 1} }); err != nil {
+			t.Fatalf("singleton registration failed: %v", err)
+		}
+		built := false
+		if err := c.Scoped(func() *otherTestService { built = true; return &otherTestService{} }); err != nil {
 			t.Fatalf("scoped registration failed: %v", err)
 		}
 		var deps []interface{}
 		if err := c.ResolveAll(&deps); err != nil {
 			t.Fatalf("resolve all failed: %v", err)
 		}
-		if len(deps) < 3 {
-			t.Fatalf("expected at least 3 dependencies, got %d", len(deps))
+		if built {
+			t.Fatal("ResolveAll instantiated a scoped registration from the root container")
+		}
+		if len(deps) != 1 {
+			t.Fatalf("expected only the singleton, got %d dependencies", len(deps))
 		}
 	})
 

@@ -2,8 +2,8 @@
 
 A lightweight, reflection-based dependency injection container for Go.
 
-[![Go Version](https://img.shields.io/badge/go-1.26+-blue.svg)](https://golang.org/dl/)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-green.svg)](#)
+[![Go Version](https://img.shields.io/badge/go-1.27+-blue.svg)](https://golang.org/dl/)
+[![Coverage](https://img.shields.io/badge/coverage-94.2%25-brightgreen.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Overview
@@ -130,13 +130,73 @@ type Scope interface {
 
 ### Factory Functions
 
-Factories are plain Go functions that take **no arguments** and return **exactly one value**:
+A factory returns **exactly one value** and takes either **no arguments** or a
+single **`dix.Resolver`**:
 
 ```go
+// No dependencies.
 container.Singleton(func() *MyService {
     return &MyService{}
 })
+
+// Dependencies resolved from the container (or the scope, for Scoped).
+container.Singleton(func(r dix.Resolver) *MyService {
+    var db *Database
+    if err := r.Resolve(&db); err != nil {
+        panic(err) // or return a service that reports the failure
+    }
+    return &MyService{DB: db}
+})
 ```
+
+Any other signature is rejected by the registration call itself with
+`ErrInvalidFactory`, rather than panicking inside `reflect.Call` on the first
+resolve.
+
+A `Scoped` factory taking a `Resolver` receives **the scope**, not the root
+container, so its own scoped dependencies stay inside the same scope.
+
+### Errors
+
+Every failure mode is a sentinel, so callers branch with `errors.Is` instead of
+matching on message text:
+
+| Error | Meaning |
+|---|---|
+| `ErrNotRegistered` | Nothing satisfies the requested type |
+| `ErrScopedFromRoot` | A `Scoped` type was resolved from the root container — resolve it from a `Scope` |
+| `ErrAmbiguousResolution` | More than one registration satisfies the requested interface; the message names them all |
+| `ErrAlreadyRegistered` | The type already has a registration |
+| `ErrInvalidFactory` | Unsupported factory signature, or `nil`/function passed to `Instance` |
+| `ErrInvalidTarget` | `Resolve` target is not a pointer, or `ResolveAll` target is not a pointer to a slice of interfaces |
+| `ErrScopeClosed` | The `Scope` was used after `Close` |
+
+### One registration per type
+
+A given type may be registered **once**, under one lifetime. Registering it
+again — even under a different lifetime — returns `ErrAlreadyRegistered`.
+
+Allowing two would force the container to choose between them by lookup
+precedence, which makes the lifetime of a dependency depend on an ordering
+nobody wrote down.
+
+### Resolving interfaces
+
+Requesting an interface matches any registered concrete type implementing it.
+If **more than one** does, resolution fails with `ErrAmbiguousResolution` and
+the error names every candidate.
+
+This is deliberate. Go randomises map iteration order, so returning "the first
+match" would resolve a different implementation on each process start — with
+two loggers registered, which one a binary used would change from boot to boot.
+Register one, or resolve the concrete type.
+
+### Concurrency
+
+`Container` and `Scope` are safe for concurrent use: registration and
+resolution may run on different goroutines at the same time. Factories are
+always invoked with the container's lock released, so a factory may resolve
+further dependencies.
 
 ## API Reference
 
@@ -148,11 +208,19 @@ Creates and returns a new container.
 
 ### `Container.Singleton(factory any) error`
 
-Registers a factory whose return value is instantiated once and shared globally.
+Registers a factory whose return value is instantiated **once, on first
+resolve**, and shared globally.
 
 | Parameter | Description |
 |-----------|-------------|
-| `factory` | `func() T` — zero-arg function returning one value |
+| `factory` | `func() T` or `func(dix.Resolver) T` |
+
+Construction is lazy and happens exactly once, even under concurrent resolves.
+A singleton factory may therefore depend on anything registered before the
+first resolve, not merely on what was registered before it.
+
+Returns `ErrInvalidFactory` for an unsupported signature, `ErrAlreadyRegistered`
+if the returned type is already registered.
 
 ---
 
@@ -162,7 +230,11 @@ Registers a factory whose return value is instantiated once per scope.
 
 | Parameter | Description |
 |-----------|-------------|
-| `factory` | `func() T` — zero-arg function returning one value |
+| `factory` | `func() T` or `func(dix.Resolver) T` — the `Resolver` is the scope |
+
+Resolving a scoped type from the **root** container returns
+`ErrScopedFromRoot` and constructs nothing: a scoped value built from the root
+would have no owning scope, so nothing would ever `Close` it.
 
 ---
 
@@ -172,7 +244,7 @@ Registers a factory that produces a new instance on every `Resolve` call.
 
 | Parameter | Description |
 |-----------|-------------|
-| `factory` | `func() T` — zero-arg function returning one value |
+| `factory` | `func() T` or `func(dix.Resolver) T` |
 
 ---
 
@@ -200,13 +272,25 @@ Sets `*target` to the resolved dependency. `target` must be a pointer.
 
 ### `Resolver.ResolveAll(target any) error`
 
-Sets `*target` to a slice containing all registered dependencies matching the target element type.
+Appends every resolvable dependency to `*target`, which must be a pointer to a
+slice of interfaces.
+
+Called on the **root container** it covers singletons and transients only —
+scoped registrations are skipped, for the same reason `Resolve` refuses them.
+Called on a **`Scope`** it covers all three, and any scoped value it builds is
+tracked by that scope and released by `Close`.
 
 ---
 
 ### `Scope.Close() error`
 
-Releases all scoped resources. Calls `Close()` on every scoped instance that implements `io.Closer`.
+Releases all scoped resources. Calls `Close()` on every scoped instance that
+has a `Close() error` method.
+
+`Close` is **idempotent** — a `defer scope.Close()` alongside an explicit call
+closes each instance once. Every closer is closed even if an earlier one
+fails; the errors are joined with `errors.Join`. After `Close`, the scope
+returns `ErrScopeClosed`.
 
 ## Examples
 

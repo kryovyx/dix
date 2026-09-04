@@ -132,9 +132,11 @@ container.Scoped(func() *RequestContext {
     }
 })
 
-container.Scoped(func() *UnitOfWork {
+container.Scoped(func(r dix.Resolver) *UnitOfWork {
     var db *Database
-    container.Resolve(&db)
+    if err := r.Resolve(&db); err != nil {
+        panic(err)
+    }
     return &UnitOfWork{db: db}
 })
 ```
@@ -157,9 +159,11 @@ container.Transient(func() *EmailMessage {
     }
 })
 
-container.Transient(func() *Command {
+container.Transient(func(r dix.Resolver) *Command {
     var repo *Repository
-    container.Resolve(&repo)
+    if err := r.Resolve(&repo); err != nil {
+        panic(err)
+    }
     return &Command{repo: repo}
 })
 ```
@@ -228,6 +232,10 @@ container.Resolve(&l)
 l.Log("Message")
 ```
 
+If **two** registered types implement `Logger`, this fails with
+`ErrAmbiguousResolution` rather than returning one of them — see the
+troubleshooting entry for why. Register one, or resolve the concrete type.
+
 ### 3. Resolve All Dependencies
 
 ```go
@@ -239,6 +247,11 @@ for _, svc := range allServices {
 }
 ```
 
+On the root container this covers singletons and transients. `Scoped`
+registrations are skipped, for the same reason `Resolve` refuses them — call
+`ResolveAll` on a `Scope` to include them, and that scope will close what it
+built.
+
 ### 4. Nested Resolution
 
 ```go
@@ -246,15 +259,19 @@ container.Singleton(func() *Database {
     return &Database{connectionString: "..."}
 })
 
-container.Singleton(func() *UserRepository {
+container.Singleton(func(r dix.Resolver) *UserRepository {
     var db *Database
-    container.Resolve(&db)
+    if err := r.Resolve(&db); err != nil {
+        panic(err)
+    }
     return &UserRepository{db: db}
 })
 
-container.Singleton(func() *UserService {
+container.Singleton(func(r dix.Resolver) *UserService {
     var repo *UserRepository
-    container.Resolve(&repo)
+    if err := r.Resolve(&repo); err != nil {
+        panic(err)
+    }
     return &UserService{repo: repo}
 })
 ```
@@ -311,9 +328,11 @@ func (d *DbTransaction) Close() error {
     return d.tx.Rollback()
 }
 
-container.Scoped(func() *DbTransaction {
+container.Scoped(func(r dix.Resolver) *DbTransaction {
     var db *Database
-    container.Resolve(&db)
+    if err := r.Resolve(&db); err != nil {
+        panic(err)
+    }
     tx, _ := db.conn.Begin()
     return &DbTransaction{tx: tx}
 })
@@ -375,16 +394,25 @@ func setupContainer() dix.Container {
     })
     
     // Scoped repository
-    container.Scoped(func() *UserRepository {
+    container.Scoped(func(r dix.Resolver) *UserRepository {
         var db *Database
-        container.Resolve(&db)
+        if err := r.Resolve(&db); err != nil {
+            panic(err)
+        }
         return &UserRepository{db: db}
     })
     
-    // Transient service
-    container.Transient(func() *UserService {
+    // Transient service.
+    //
+    // The Resolver argument is not optional here: UserService depends on the
+    // Scoped UserRepository, so it has to resolve through whatever Resolver
+    // asked for it. Closing over `container` would resolve the repository from
+    // the root, which returns ErrScopedFromRoot.
+    container.Transient(func(r dix.Resolver) *UserService {
         var repo *UserRepository
-        container.Resolve(&repo)
+        if err := r.Resolve(&repo); err != nil {
+            panic(err)
+        }
         return &UserService{repo: repo}
     })
     
@@ -615,16 +643,20 @@ func registerServices(container dix.Container, env string) {
 func TestUserService(t *testing.T) {
     container := dix.New()
     
-    // Register mock
+    // Register mock. Depend on an interface, not the concrete repository —
+    // a mock is a different type, so a factory asking for *UserRepository
+    // will not find *MockUserRepository.
     mockRepo := &MockUserRepository{
         users: []User{{ID: 1, Name: "Test"}},
     }
     container.Instance(mockRepo)
     
     // Register service
-    container.Singleton(func() *UserService {
-        var repo *UserRepository
-        container.Resolve(&repo)
+    container.Singleton(func(r dix.Resolver) *UserService {
+        var repo UserRepository // interface
+        if err := r.Resolve(&repo); err != nil {
+            t.Fatal(err)
+        }
         return &UserService{repo: repo}
     })
     
@@ -664,7 +696,7 @@ func LoggingMiddleware(container dix.Container) Middleware {
 
 ## Troubleshooting
 
-### Error: "no registration for type"
+### `ErrNotRegistered`
 
 **Problem:** Trying to resolve a type that hasn't been registered.
 
@@ -682,7 +714,7 @@ var service *MyService
 container.Resolve(&service) // OK
 ```
 
-### Error: "target must be a pointer"
+### `ErrInvalidTarget`
 
 **Problem:** Passing a non-pointer value to `Resolve()`.
 
@@ -697,22 +729,107 @@ var service *MyService
 container.Resolve(&service) // OK
 ```
 
-### Error: "factory must be a function returning one value"
+### `ErrInvalidFactory`
 
-**Problem:** Factory function signature is incorrect.
+**Problem:** The factory signature is not one of the two accepted forms.
 
 **Solution:**
 ```go
-// Wrong
-container.Singleton(func() (*MyService, error) { // Error!
+// Wrong — two return values
+container.Singleton(func() (*MyService, error) {
     return &MyService{}, nil
 })
 
-// Correct
+// Wrong — an argument that is not a dix.Resolver
+container.Singleton(func(cfg *Config) *MyService {
+    return &MyService{cfg: cfg}
+})
+
+// Correct — no arguments
 container.Singleton(func() *MyService {
     return &MyService{}
 })
+
+// Correct — dependencies via the Resolver
+container.Singleton(func(r dix.Resolver) *MyService {
+    var cfg *Config
+    if err := r.Resolve(&cfg); err != nil {
+        panic(err)
+    }
+    return &MyService{cfg: cfg}
+})
 ```
+
+### `ErrScopedFromRoot`
+
+**Problem:** A `Scoped` type was resolved from the root container.
+
+The container refuses rather than obliging, because a scoped value built from
+the root has no owning scope — nothing would ever call its `Close`, so every
+resolve would leak it.
+
+**Solution:** resolve it from a scope, and let dependent factories take a
+`Resolver` so they inherit the caller's scope:
+```go
+container.Scoped(func() *RequestContext { return &RequestContext{} })
+
+// Wrong
+var rc *RequestContext
+container.Resolve(&rc) // ErrScopedFromRoot
+
+// Correct
+scope := container.NewScope()
+defer scope.Close()
+var rc *RequestContext
+scope.Resolve(&rc) // OK
+
+// Correct — a dependent factory inherits whatever Resolver asked for it
+container.Transient(func(r dix.Resolver) *Handler {
+    var rc *RequestContext
+    if err := r.Resolve(&rc); err != nil {
+        panic(err)
+    }
+    return &Handler{rc: rc}
+})
+```
+
+### `ErrAmbiguousResolution`
+
+**Problem:** Two or more registered types satisfy the interface being resolved.
+
+Picking one would mean picking by Go's randomised map iteration order, so the
+same binary would resolve a different implementation on each start. The error
+names every candidate.
+
+**Solution:** register one implementation, or resolve the concrete type:
+```go
+container.Instance(&FileLogger{})
+container.Instance(&ConsoleLogger{})
+
+// Wrong
+var l Logger
+container.Resolve(&l) // ErrAmbiguousResolution: *FileLogger, *ConsoleLogger
+
+// Correct — ask for what you actually want
+var l *FileLogger
+container.Resolve(&l) // OK
+```
+
+### `ErrAlreadyRegistered`
+
+**Problem:** The same type was registered twice.
+
+**Solution:** pick one lifetime. A type may hold only one registration, because
+two would make the effective lifetime depend on lookup precedence rather than
+on anything the author chose.
+
+### `ErrScopeClosed`
+
+**Problem:** A scope was used after `Close`. Usually a `defer scope.Close()`
+in an outer function while an inner goroutine still holds the scope.
+
+**Solution:** keep the scope alive until every goroutine using it has finished,
+or give each goroutine its own scope.
 
 ### Circular Dependencies
 
@@ -729,19 +846,25 @@ type ServiceB struct {
     a *ServiceA
 }
 
-container.Singleton(func() *ServiceA {
+container.Singleton(func(r dix.Resolver) *ServiceA {
     return &ServiceA{
+        // Deferred: resolved on first call, not during construction, so the
+        // cycle is broken in time rather than in structure.
         getB: func() *ServiceB {
             var b *ServiceB
-            container.Resolve(&b)
+            if err := r.Resolve(&b); err != nil {
+                panic(err)
+            }
             return b
         },
     }
 })
 
-container.Singleton(func() *ServiceB {
+container.Singleton(func(r dix.Resolver) *ServiceB {
     var a *ServiceA
-    container.Resolve(&a)
+    if err := r.Resolve(&a); err != nil {
+        panic(err)
+    }
     return &ServiceB{a: a}
 })
 ```
